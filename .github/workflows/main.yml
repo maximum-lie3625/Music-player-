@@ -1,0 +1,423 @@
+name: Build Remix Player APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'__EOF__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "RemixPlayer"
+          include(":app")
+          __EOF__
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          __EOF__
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'__EOF__'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          __EOF__
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'__EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.example.remixplayer"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.remixplayer"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.media3:media3-exoplayer:1.4.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          __EOF__
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'__EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <application
+                  android:allowBackup="true"
+                  android:label="Remix Player"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __EOF__
+          mkdir -p $(dirname app/src/main/java/com/example/remixplayer/Library.kt)
+          cat > app/src/main/java/com/example/remixplayer/Library.kt <<'__EOF__'
+          package com.example.remixplayer
+
+          import android.content.ContentUris
+          import android.content.Context
+          import android.net.Uri
+          import android.provider.MediaStore
+
+          data class Track(val id: Long, val title: String, val artist: String, val uri: Uri, val durationMs: Long)
+
+          object Library {
+              fun load(ctx: Context): List<Track> {
+                  val out = ArrayList<Track>()
+                  val base = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                  val proj = arrayOf(
+                      MediaStore.Audio.Media._ID,
+                      MediaStore.Audio.Media.TITLE,
+                      MediaStore.Audio.Media.ARTIST,
+                      MediaStore.Audio.Media.DURATION
+                  )
+                  val sel = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND ${MediaStore.Audio.Media.DURATION} > 30000"
+                  val order = "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC"
+                  ctx.contentResolver.query(base, proj, sel, null, order)?.use { c ->
+                      val iId = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                      val iT = c.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
+                      val iA = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
+                      val iD = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+                      while (c.moveToNext()) {
+                          val id = c.getLong(iId)
+                          out.add(
+                              Track(
+                                  id,
+                                  c.getString(iT) ?: "Unknown",
+                                  c.getString(iA) ?: "Unknown",
+                                  ContentUris.withAppendedId(base, id),
+                                  c.getLong(iD)
+                              )
+                          )
+                      }
+                  }
+                  return out
+              }
+          }
+          __EOF__
+          mkdir -p $(dirname app/src/main/java/com/example/remixplayer/BpmDetector.kt)
+          cat > app/src/main/java/com/example/remixplayer/BpmDetector.kt <<'__EOF__'
+          package com.example.remixplayer
+
+          import android.content.Context
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.net.Uri
+          import java.nio.ByteOrder
+          import kotlin.math.max
+          import kotlin.math.sqrt
+
+          /** Decodes ~25s of the track, builds a low-frequency energy envelope, finds tempo by autocorrelation. */
+          object BpmDetector {
+              private const val ENV_RATE = 200
+
+              fun detect(ctx: Context, uri: Uri): Float? = try {
+                  tempoFrom(envelope(ctx, uri, 20, 25))
+              } catch (e: Exception) {
+                  null
+              }
+
+              private fun envelope(ctx: Context, uri: Uri, startSec: Int, lenSec: Int): FloatArray {
+                  val ex = MediaExtractor()
+                  var codec: MediaCodec? = null
+                  try {
+                      ex.setDataSource(ctx, uri, null)
+                      var idx = -1
+                      var fmt: MediaFormat? = null
+                      for (i in 0 until ex.trackCount) {
+                          val f = ex.getTrackFormat(i)
+                          if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                              idx = i; fmt = f; break
+                          }
+                      }
+                      if (idx < 0 || fmt == null) return FloatArray(0)
+                      ex.selectTrack(idx)
+                      val mime = fmt.getString(MediaFormat.KEY_MIME)!!
+                      val durUs = if (fmt.containsKey(MediaFormat.KEY_DURATION)) fmt.getLong(MediaFormat.KEY_DURATION) else 0L
+                      if (durUs > (startSec + lenSec) * 1_000_000L) {
+                          ex.seekTo(startSec * 1_000_000L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                      }
+                      val c = MediaCodec.createDecoderByType(mime)
+                      codec = c
+                      c.configure(fmt, null, null, 0)
+                      c.start()
+
+                      var sr = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                      var ch = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                      var hop = sr / ENV_RATE
+                      val env = ArrayList<Float>()
+                      val maxFrames = ENV_RATE * lenSec
+                      val info = MediaCodec.BufferInfo()
+                      var lp = 0f
+                      var acc = 0.0
+                      var n = 0
+                      var inDone = false
+                      var outDone = false
+                      var guard = 0
+
+                      while (!outDone && env.size < maxFrames && guard++ < 20000) {
+                          if (!inDone) {
+                              val i = c.dequeueInputBuffer(10_000)
+                              if (i >= 0) {
+                                  val buf = c.getInputBuffer(i)!!
+                                  val size = ex.readSampleData(buf, 0)
+                                  if (size < 0) {
+                                      c.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                      inDone = true
+                                  } else {
+                                      c.queueInputBuffer(i, 0, size, ex.sampleTime, 0)
+                                      ex.advance()
+                                  }
+                              }
+                          }
+                          val o = c.dequeueOutputBuffer(info, 10_000)
+                          if (o >= 0) {
+                              val buf = c.getOutputBuffer(o)
+                              if (buf != null && info.size > 0) {
+                                  buf.position(info.offset)
+                                  buf.limit(info.offset + info.size)
+                                  val s = buf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                                  while (s.remaining() >= ch) {
+                                      var m = 0f
+                                      for (k in 0 until ch) m += s.get()
+                                      m /= ch * 32768f
+                                      lp += 0.08f * (m - lp)
+                                      acc += (lp * lp).toDouble()
+                                      n++
+                                      if (n >= hop) {
+                                          env.add(sqrt(acc / n).toFloat())
+                                          acc = 0.0
+                                          n = 0
+                                      }
+                                  }
+                              }
+                              if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outDone = true
+                              c.releaseOutputBuffer(o, false)
+                          } else if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                              val f = c.outputFormat
+                              sr = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                              ch = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                              hop = sr / ENV_RATE
+                          }
+                      }
+                      return env.toFloatArray()
+                  } finally {
+                      try { codec?.stop(); codec?.release() } catch (e: Exception) { }
+                      ex.release()
+                  }
+              }
+
+              private fun tempoFrom(env: FloatArray): Float? {
+                  val n = env.size
+                  if (n < ENV_RATE * 8) return null
+                  val onset = FloatArray(n)
+                  for (i in 1 until n) onset[i] = max(0f, env[i] - env[i - 1])
+                  val mean = onset.average().toFloat()
+                  for (i in 0 until n) onset[i] -= mean
+
+                  var best = Float.NEGATIVE_INFINITY
+                  var bestBpm = 0f
+                  var bpm = 70f
+                  while (bpm <= 180f) {
+                      val lag = 60f / bpm * ENV_RATE
+                      val score = acf(onset, lag) + 0.5f * acf(onset, lag * 2)
+                      if (score > best) { best = score; bestBpm = bpm }
+                      bpm += 0.5f
+                  }
+                  if (bestBpm <= 0f) return null
+                  while (bestBpm < 80f) bestBpm *= 2
+                  while (bestBpm > 170f) bestBpm /= 2
+                  return Math.round(bestBpm * 10) / 10f
+              }
+
+              private fun acf(o: FloatArray, lag: Float): Float {
+                  val l = lag.toInt()
+                  val fr = lag - l
+                  var s = 0f
+                  for (i in 0 until o.size - l - 1) s += o[i] * (o[i + l] * (1 - fr) + o[i + l + 1] * fr)
+                  return s / (o.size - l)
+              }
+          }
+          __EOF__
+          mkdir -p $(dirname app/src/main/java/com/example/remixplayer/Deck.kt)
+          cat > app/src/main/java/com/example/remixplayer/Deck.kt <<'__EOF__'
+          package com.example.remixplayer
+
+          import android.content.Context
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableLongStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.PlaybackParameters
+          import androidx.media3.common.Player
+          import androidx.media3.exoplayer.ExoPlayer
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          class Deck(context: Context) {
+              private val appContext = context.applicationContext
+              private val player = ExoPlayer.Builder(appContext).build()
+
+              var track by mutableStateOf<Track?>(null)
+                  private set
+              var bpm by mutableStateOf<Float?>(null)
+                  private set
+              var analyzing by mutableStateOf(false)
+                  private set
+              var playing by mutableStateOf(false)
+                  private set
+              var tempo by mutableFloatStateOf(1f)
+                  private set
+              var keyLock by mutableStateOf(true)
+                  private set
+              var positionMs by mutableLongStateOf(0L)
+                  private set
+              var durationMs by mutableLongStateOf(0L)
+                  private set
+
+              /** BPM you actually hear after the tempo slider. */
+              val effectiveBpm: Float? get() = bpm?.let { it * tempo }
+
+              init {
+                  player.addListener(object : Player.Listener {
+                      override fun onIsPlayingChanged(isPlaying: Boolean) { playing = isPlaying }
+                  })
+              }
+
+              fun load(t: Track, scope: CoroutineScope) {
+                  track = t
+                  bpm = null
+                  analyzing = true
+                  tempo = 1f
+                  player.setMediaItem(MediaItem.fromUri(t.uri))
+                  player.prepare()
+                  applyParams()
+                  scope.launch {
+                      val result = withContext(Dispatchers.Default) { BpmDetector.detect(appContext, t.uri) }
+                      if (track === t) { bpm = result; analyzing = false }
+                  }
+              }
+
+              private fun applyParams() {
+                  player.playbackParameters = PlaybackParameters(tempo, if (keyLock) 1f else tempo)
+              }
+
+              fun setTempo(v: Float) { tempo = v.coerceIn(0.8f, 1.25f); applyParams() }
+              fun toggleKeyLock() { keyLock = !keyLock; applyParams() }
+              fun toggle() {
+                  if (track == null) return
+                  if (player.isPlaying) player.pause() else player.play()
+              }
+              fun pause() = player.pause()
+              fun seekToFraction(f: Float) { if (durationMs > 0) player.seekTo((durationMs * f).toLong()) }
+              fun nudge(ms: Long) { player.seekTo((player.currentPosition + ms).coerceAtLeast(0L)) }
+              fun setGain(g: Float) { player.volume = g.coerceIn(0f, 1f) }
+              fun scaleBpm(factor: Float) { bpm = bpm?.let { (it * factor).coerceIn(40f, 220f) } }
+
+              /** Match this deck's heard BPM to the other deck's heard BPM. */
+              fun syncTo(o: Deck) {
+                  val mine = bpm ?: return
+                  val theirs = o.effectiveBpm ?: return
+                  setTempo(theirs / mine)
+              }
+
+              fun tick() {
+                  positionMs = player.currentPosition
+                  durationMs = player.duration.coerceAtLeast(0L)
+              }
+
+              fun release() = player.release()
+          }
+          __EOF__
+          mkdir -p $(dirname app/src/main/java/com/example/remixplayer/MainActivity.kt)
+          cat > app/src/main/java/com/example/remixplayer/MainActivity.kt <<'__EOF__'
+          package com.example.remixplayer
+
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.FilledTonalButton
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Slider
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.DisposableEffect
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.Dispat
