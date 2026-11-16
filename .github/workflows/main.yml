@@ -420,4 +420,191 @@ jobs:
           import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
           import androidx.core.content.ContextCompat
-          import kotlinx.coroutines.Dispat
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import kotlin.math.PI
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { App() }
+              }
+          }
+
+          private val accents = listOf(Color(0xFF7C4DFF), Color(0xFF00E5FF), Color(0xFFFF4081), Color(0xFF69F0AE))
+          private val audioPerm =
+              if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO
+              else Manifest.permission.READ_EXTERNAL_STORAGE
+
+          @Composable
+          fun App() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val a = remember { Deck(ctx) }
+              val b = remember { Deck(ctx) }
+              DisposableEffect(Unit) { onDispose { a.release(); b.release() } }
+
+              var accent by remember { mutableIntStateOf(0) }
+              var granted by remember {
+                  mutableStateOf(ContextCompat.checkSelfPermission(ctx, audioPerm) == PackageManager.PERMISSION_GRANTED)
+              }
+              val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
+              var tracks by remember { mutableStateOf(emptyList<Track>()) }
+              LaunchedEffect(granted) {
+                  if (granted) tracks = withContext(Dispatchers.IO) { Library.load(ctx) }
+                  else launcher.launch(audioPerm)
+              }
+
+              var cross by remember { mutableFloatStateOf(0.5f) }
+              LaunchedEffect(cross) {
+                  val x = cross * PI.toFloat() / 2f
+                  a.setGain(cos(x))   // equal-power crossfade
+                  b.setGain(sin(x))
+              }
+
+              var sleepMin by remember { mutableIntStateOf(0) }
+              LaunchedEffect(sleepMin) {
+                  if (sleepMin > 0) {
+                      delay(sleepMin * 60_000L)
+                      a.pause(); b.pause()
+                      sleepMin = 0
+                  }
+              }
+
+              var query by remember { mutableStateOf("") }
+              val shown = remember(tracks, query) {
+                  if (query.isBlank()) tracks
+                  else tracks.filter { it.title.contains(query, true) || it.artist.contains(query, true) }
+              }
+
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = accents[accent],
+                      background = Color(0xFF0E0E14),
+                      surface = Color(0xFF181822)
+                  )
+              ) {
+                  Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                      LazyColumn(
+                          contentPadding = PaddingValues(12.dp),
+                          verticalArrangement = Arrangement.spacedBy(10.dp)
+                      ) {
+                          item {
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Text("Remix Player", Modifier.weight(1f), style = MaterialTheme.typography.headlineSmall)
+                                  TextButton(onClick = { accent = (accent + 1) % accents.size }) { Text("Theme") }
+                                  TextButton(onClick = {
+                                      sleepMin = when (sleepMin) { 0 -> 15; 15 -> 30; 30 -> 60; else -> 0 }
+                                  }) { Text(if (sleepMin == 0) "Sleep" else "Sleep ${sleepMin}m") }
+                              }
+                          }
+                          item { DeckCard("A", a, b) }
+                          item {
+                              Column {
+                                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                                      verticalAlignment = Alignment.CenterVertically) {
+                                      Text("A")
+                                      TextButton(onClick = {
+                                          scope.launch {
+                                              val toB = cross < 0.5f
+                                              val incoming = if (toB) b else a
+                                              val outgoing = if (toB) a else b
+                                              incoming.syncTo(outgoing)
+                                              if (!incoming.playing) incoming.toggle()
+                                              val start = cross
+                                              val target = if (toB) 1f else 0f
+                                              for (i in 1..80) {
+                                                  cross = start + (target - start) * i / 80f
+                                                  delay(100)
+                                              }
+                                          }
+                                      }) { Text("Auto-mix 8s") }
+                                      Text("B")
+                                  }
+                                  Slider(value = cross, onValueChange = { cross = it })
+                              }
+                          }
+                          item { DeckCard("B", b, a) }
+                          item {
+                              OutlinedTextField(
+                                  value = query, onValueChange = { query = it },
+                                  label = { Text("Search songs") }, singleLine = true,
+                                  modifier = Modifier.fillMaxWidth()
+                              )
+                          }
+                          items(shown, key = { it.id }) { t ->
+                              Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                  Column(Modifier.weight(1f)) {
+                                      Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                      Text(t.artist, style = MaterialTheme.typography.bodySmall,
+                                          maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                  }
+                                  TextButton(onClick = { a.load(t, scope) }) { Text("A") }
+                                  TextButton(onClick = { b.load(t, scope) }) { Text("B") }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun DeckCard(name: String, d: Deck, other: Deck) {
+              LaunchedEffect(d) { while (true) { d.tick(); delay(250) } }
+              Card(Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text(
+                              "$name  ${d.track?.title ?: "Load a track"}",
+                              Modifier.weight(1f),
+                              style = MaterialTheme.typography.titleMedium,
+                              maxLines = 1, overflow = TextOverflow.Ellipsis
+                          )
+                          val bpmText = when {
+                              d.analyzing -> "analyzing..."
+                              d.effectiveBpm != null -> "%.1f BPM".format(d.effectiveBpm)
+                              else -> "-- BPM"
+                          }
+                          Text(bpmText, color = MaterialTheme.colorScheme.primary)
+                      }
+                      val frac = if (d.durationMs > 0) d.positionMs.toFloat() / d.durationMs else 0f
+                      Slider(value = frac.coerceIn(0f, 1f), onValueChange = { d.seekToFraction(it) })
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                          Button(onClick = { d.toggle() }) { Text(if (d.playing) "Pause" else "Play") }
+                          FilledTonalButton(onClick = { d.syncTo(other) }) { Text("Sync") }
+                          TextButton(onClick = { d.nudge(-40) }) { Text("<") }
+                          TextButton(onClick = { d.nudge(40) }) { Text(">") }
+                      }
+                      Text("Tempo %+.1f%%".format((d.tempo - 1f) * 100f), style = MaterialTheme.typography.bodySmall)
+                      Slider(value = d.tempo, onValueChange = { d.setTempo(it) }, valueRange = 0.8f..1.25f)
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          TextButton(onClick = { d.scaleBpm(0.5f) }) { Text("BPM /2") }
+                          TextButton(onClick = { d.scaleBpm(2f) }) { Text("BPM x2") }
+                          TextButton(onClick = { d.setTempo(1f) }) { Text("Reset") }
+                          Spacer(Modifier.weight(1f))
+                          Text("Key lock")
+                          Switch(checked = d.keyLock, onCheckedChange = { d.toggleKeyLock() },
+                              modifier = Modifier.padding(start = 6.dp))
+                      }
+                  }
+              }
+          }
+          __EOF__
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemixPlayer-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          
